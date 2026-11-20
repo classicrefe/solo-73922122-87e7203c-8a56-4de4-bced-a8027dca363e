@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -18,6 +19,7 @@ from . import db
 from .alignment import analyze_labels, check_joint
 from .schemas import (ValidationError, normalize_labels, normalize_selections,
                       validate_text)
+from .stitch import Segment, StitchValidationError, normalize_request, plan_stitch
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -27,6 +29,11 @@ app = FastAPI(title="OCR 标签迁移工具")
 
 @app.exception_handler(ValidationError)
 async def validation_handler(_req: Request, exc: ValidationError):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(StitchValidationError)
+async def stitch_validation_handler(_req: Request, exc: StitchValidationError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
@@ -45,6 +52,11 @@ class SelectionsIn(BaseModel):
 
 class ConfirmIn(BaseModel):
     revision: int
+
+
+class StitchIn(BaseModel):
+    segments: object    # [{session_id, revision}]，由 normalize_request 校验
+    seams: object       # [{candidates: [int, ...]}]
 
 
 # ---------------- 工具 ----------------
@@ -288,6 +300,110 @@ def download(sid: str):
         headers={
             "Content-Disposition":
                 f'attachment; filename="labels_revised_r{sess["revision"]}.json"'
+        })
+
+
+# ---------------- 拼稿 ----------------
+
+@app.post("/api/stitches", status_code=200)
+def create_stitch(payload: StitchIn):
+    """按阅读顺序拼合多个已确认会话。
+
+    所有会话在同一个 IMMEDIATE 事务、同一次数据库快照中读取：
+    会话不存在 / revision 过期 / 对应 revision 未确认，整次停下并指出
+    是第几段的哪个会话。只有“唯一最短合法拼法”才落库并给出下载地址；
+    并列最短或无解都不生成任何文件（数据库行）。
+    """
+    refs, candidates_per_seam = normalize_request(
+        payload.segments, payload.seams)
+
+    conn = db.connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        segments: list[Segment] = []
+        for index, ref in enumerate(refs, start=1):
+            row = conn.execute(
+                "SELECT id, revision FROM sessions WHERE id=?",
+                (ref["session_id"],)).fetchone()
+            if row is None:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "session_not_found",
+                            "message": f"第 {index} 段的会话 {ref['session_id']!r} 不存在",
+                            "session_index": index,
+                            "session_id": ref["session_id"]})
+            if row["revision"] != ref["revision"]:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "stale_revision",
+                            "message": f"第 {index} 段会话 {ref['session_id']!r} 的版本已过期"
+                                       f"（提交 r{ref['revision']}，当前 r{row['revision']}），整次拼稿中止",
+                            "session_index": index,
+                            "session_id": ref["session_id"],
+                            "submitted_revision": ref["revision"],
+                            "current_revision": row["revision"]})
+            rrow = conn.execute(
+                "SELECT data FROM results WHERE session_id=? AND revision=?",
+                (ref["session_id"], ref["revision"])).fetchone()
+            if rrow is None:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "unconfirmed",
+                            "message": f"第 {index} 段会话 {ref['session_id']!r} 的 r{ref['revision']} "
+                                       "尚未确认成功，整次拼稿中止",
+                            "session_index": index,
+                            "session_id": ref["session_id"],
+                            "revision": ref["revision"]})
+            result_data = json.loads(rrow["data"])
+            segments.append(Segment(
+                session_index=index,
+                session_id=ref["session_id"],
+                revision=ref["revision"],
+                text=result_data["revised"],
+                labels=result_data["labels"],
+            ))
+
+        plan = plan_stitch(segments, candidates_per_seam)
+
+        if plan["status"] != "unique":
+            # 并列最短 / 无解：不落任何行
+            conn.rollback()
+            plan["download_url"] = None
+            plan["stitch_id"] = None
+            return plan
+
+        stitch_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO stitches(id, data, created_at) VALUES (?,?,?)",
+            (stitch_id, json.dumps(plan["result"], ensure_ascii=False),
+             db._now()))
+        conn.commit()
+        plan["stitch_id"] = stitch_id
+        plan["download_url"] = f"/api/stitches/{stitch_id}/download"
+        return plan
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+
+@app.get("/api/stitches/{stitch_id}/download")
+def download_stitch(stitch_id: str):
+    """只有唯一最短合法拼法落过库，才能下载。"""
+    stitch = db.get_stitch(stitch_id)
+    if stitch is None:
+        raise HTTPException(
+            status_code=404,
+            detail="拼稿结果不存在：只有唯一最短的合法拼法才会生成文件，"
+                   "并列最短与无解均不生成")
+    return JSONResponse(
+        content=stitch["data"],
+        headers={
+            "Content-Disposition":
+            f'attachment; filename="stitched_{stitch_id[:8]}.json"'
         })
 
 

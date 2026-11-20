@@ -5,6 +5,7 @@
                每次修改输入 revision 必变（不是内容哈希，改回去也不会复原）。
 - selections:  用户在某个 revision 上的选择，随 revision 失效。
 - results:     确认成功后原子写入的最终结果；失败不落任何行。
+- stitches:    拼稿唯一最短合法拼法的可下载结果；并列/无解不落任何行。
 
 并发：每次操作独立连接，关键写路径用 BEGIN IMMEDIATE 串行化，
 确认时的"检查 revision + 写结果"在同一事务内完成，避免 TOCTOU。
@@ -41,6 +42,11 @@ CREATE TABLE IF NOT EXISTS results (
   data       TEXT NOT NULL,
   created_at TEXT NOT NULL,
   PRIMARY KEY (session_id, revision)
+);
+CREATE TABLE IF NOT EXISTS stitches (
+  id         TEXT PRIMARY KEY,
+  data       TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 """
 
@@ -139,6 +145,18 @@ def get_result(sid: str, revision: int) -> dict | None:
         row = conn.execute(
             "SELECT data, created_at FROM results"
             " WHERE session_id=? AND revision=?", (sid, revision)).fetchone()
+    if row is None:
+        return None
+    return {"data": json.loads(row["data"]), "created_at": row["created_at"]}
+
+
+# ---------- stitches ----------
+
+def get_stitch(stitch_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT data, created_at FROM stitches WHERE id=?",
+            (stitch_id,)).fetchone()
     if row is None:
         return None
     return {"data": json.loads(row["data"]), "created_at": row["created_at"]}

@@ -326,12 +326,211 @@ function init() {
   $("confirm").addEventListener("click", confirmAll);
   updateCounts();
 
+  initTabs();
+  initStitch();
+
   const sid = new URLSearchParams(location.search).get("session");
   if (sid) {
     state.sessionId = sid;
     reloadState().catch(() => showBanner("会话不存在或加载失败", true));
   }
   state.pollTimer = setInterval(poll, 3000);
+}
+
+/* ---------- 标签页 ---------- */
+function initTabs() {
+  document.querySelectorAll(".tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach((b) =>
+        b.classList.toggle("active", b === btn));
+      const name = btn.dataset.tab;
+      $("page-migrate").classList.toggle("hidden", name !== "migrate");
+      $("page-stitch").classList.toggle("hidden", name !== "stitch");
+    });
+  });
+}
+
+/* ---------- 拼稿 ---------- */
+const STITCH_DEMO = [
+  { revised: "甲乙丙丁戊", labels: [{ id: "L1", start: 3, end: 5 }] },
+  { revised: "丁戊己庚", labels: [{ id: "L1", start: 0, end: 2 }, { id: "L2", start: 2, end: 4 }] },
+  { revised: "己庚辛壬", labels: [{ id: "L9", start: 0, end: 2 }] },
+];
+
+const stitchState = { segmentCount: 2 };
+
+function stitchEl() {
+  const box = $("stitch-segments");
+  box.innerHTML = "";
+  for (let i = 1; i <= stitchState.segmentCount; i++) {
+    const row = document.createElement("div");
+    row.className = "stitch-row";
+    row.innerHTML = `
+      <span class="stitch-idx">第 ${i} 段</span>
+      <input type="text" class="stitch-sid" placeholder="会话 ID（session_id）" spellcheck="false">
+      <input type="number" min="1" class="stitch-rev" placeholder="确认版本 revision" title="确认版本 revision">`;
+    box.appendChild(row);
+  }
+  $("stitch-seg-count").textContent = `${stitchState.segmentCount} 段（允许 2～6）`;
+  renderSeamInputs();
+}
+
+function renderSeamInputs() {
+  const n = stitchState.segmentCount;
+  const box = $("stitch-seams");
+  box.innerHTML = "";
+  if (n < 2) { box.textContent = "先确定段数。"; return; }
+  for (let i = 1; i < n; i++) {
+    const row = document.createElement("div");
+    row.className = "stitch-row";
+    row.innerHTML = `
+      <span class="stitch-idx">接缝 ${i}（第 ${i} 段末尾 ↔ 第 ${i + 1} 段开头）</span>
+      <input type="text" class="stitch-cands" placeholder="1～3 个候选重叠码点数，逗号分隔，如 1,2,3" spellcheck="false">`;
+    box.appendChild(row);
+  }
+}
+
+function collectStitchRequest() {
+  const segments = [...document.querySelectorAll("#stitch-segments .stitch-row")]
+    .map((row) => ({
+      session_id: row.querySelector(".stitch-sid").value.trim(),
+      revision: Number(row.querySelector(".stitch-rev").value),
+    }));
+  const seams = [...document.querySelectorAll("#stitch-seams .stitch-row")]
+    .map((row) => {
+      const cands = row.querySelector(".stitch-cands").value
+        .split(",").map((s) => s.trim()).filter(Boolean).map(Number);
+      return { candidates: cands };
+    });
+  return { segments, seams };
+}
+
+function fillStitchForm(refs, candidatesPerSeam) {
+  stitchState.segmentCount = refs.length;
+  stitchEl();
+  const rows = document.querySelectorAll("#stitch-segments .stitch-row");
+  refs.forEach((ref, i) => {
+    rows[i].querySelector(".stitch-sid").value = ref.session_id;
+    rows[i].querySelector(".stitch-rev").value = ref.revision;
+  });
+  const seamRows = document.querySelectorAll("#stitch-seams .stitch-row");
+  candidatesPerSeam.forEach((cands, i) => {
+    seamRows[i].querySelector(".stitch-cands").value = cands.join(",");
+  });
+}
+
+async function loadStitchDemo() {
+  hideBanner();
+  $("stitch-run-status").textContent = "示例会话创建中…";
+  try {
+    const refs = [];
+    for (const item of STITCH_DEMO) {
+      const r = await api("/api/sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          original: item.revised, revised: item.revised, labels: item.labels,
+        }),
+      });
+      const c = await api(`/api/sessions/${r.session_id}/confirm`, {
+        method: "POST", body: JSON.stringify({ revision: r.revision }),
+      });
+      if (!c.ok) throw new Error("示例会话确认失败");
+      refs.push({ session_id: r.session_id, revision: r.revision });
+    }
+    fillStitchForm(refs, [[1, 2, 3], [1, 2]]);
+    $("stitch-run-status").textContent = "示例已填入，可直接试拼。";
+  } catch (e) {
+    $("stitch-run-status").textContent = "";
+    showBanner("示例创建失败：" + detailMessage(e.data), true);
+  }
+}
+
+function renderRejections(rejections) {
+  if (!rejections || !rejections.length) return "";
+  const items = rejections.map((r) =>
+    `<li>接缝 ${r.seam_index}，候选 ${r.candidate}：${esc(r.reason)}</li>`).join("");
+  return `<div class="stitch-sub"><strong>被拒候选：</strong><ul>${items}</ul></div>`;
+}
+
+function renderStitchResult(body) {
+  const box = $("stitch-result");
+  const prev = $("stitch-preview");
+  const dl = $("stitch-download");
+  dl.classList.add("hidden");
+  prev.classList.add("hidden");
+  let html = "";
+  if (body.status === "unique") {
+    const r = body.result;
+    html = `<div class="stitch-ok">✅ ${esc(body.message)}</div>
+      <div class="stitch-sub">各接缝采用重叠码点数：${r.meta.overlaps.join("、")}</div>
+      <div class="stitch-sub">各段在合稿中的半开区间：</div>
+      <ul>${r.segments.map((s) =>
+        `<li>第 ${s.session_index} 段（会话 ${esc(s.session_id.slice(0, 8))}…，r${s.revision}）：[${s.start}, ${s.end})，长 ${s.length}</li>`).join("")}</ul>
+      <div class="stitch-sub">合稿标签（完全重合已合并，sources 记录会话号与标签号）：</div>
+      <ul>${r.labels.map((l) =>
+        `<li>${esc(l.id)} [${l.start}, ${l.end}) “${esc(l.text)}” ← ` +
+        l.sources.map((src) => `第${src.session_index}段·${esc(src.label_id)}`).join("，") + `</li>`).join("")}</ul>`;
+    dl.href = body.download_url;
+    dl.classList.remove("hidden");
+    prev.textContent = JSON.stringify(r, null, 2);
+    prev.classList.remove("hidden");
+  } else if (body.status === "tie") {
+    html = `<div class="stitch-warn">⚠️ ${esc(body.message)}</div>
+      <div class="stitch-sub">并列最短的重叠长度组合（请复核后收窄候选，本次不生成文件）：</div>
+      <ul>${body.ties.map((t) => `<li>[${t.overlaps.join(", ")}]</li>`).join("")}</ul>`;
+  } else {
+    html = `<div class="stitch-bad">❌ ${esc(body.message)}</div>`;
+    if (body.reason === "label_conflict" && body.label_conflicts) {
+      html += `<div class="stitch-sub">非完全重合的标签相交：</div><ul>` +
+        body.label_conflicts.slice(0, 8).map((cf) =>
+          `<li>重叠 [${cf.overlaps.join(",")}] 下：第${cf.label_a.session_index}段标签 ${esc(cf.label_a.label_id)} 与 第${cf.label_b.session_index}段标签 ${esc(cf.label_b.label_id)}</li>`).join("") +
+        `</ul><div class="hint">请检查接缝候选或标签后重试；本次不生成文件。</div>`;
+    } else {
+      html += `<div class="hint">请检查接缝重叠长度或标签后重试；本次不生成文件。</div>`;
+    }
+  }
+  html += renderRejections(body.seam_rejections);
+  box.innerHTML = html;
+}
+
+async function runStitch() {
+  hideBanner();
+  $("stitch-run-status").textContent = "试拼中…";
+  const payload = collectStitchRequest();
+  try {
+    const body = await api("/api/stitches", {
+      method: "POST", body: JSON.stringify(payload),
+    });
+    $("stitch-run-status").textContent = "完成";
+    renderStitchResult(body);
+  } catch (e) {
+    $("stitch-run-status").textContent = "";
+    const d = e.data && e.data.detail;
+    if (d && typeof d === "object" && d.message) {
+      showBanner("拼稿中止：" + d.message, true);
+      $("stitch-result").innerHTML =
+        `<div class="stitch-bad">❌ ${esc(d.message)}</div>` +
+        (d.session_index ? `<div class="hint">问题出在第 ${d.session_index} 段。</div>` : "");
+    } else {
+      showBanner("拼稿失败：" + detailMessage(e.data), true);
+    }
+  }
+}
+
+function initStitch() {
+  $("stitch-add-segment").addEventListener("click", () => {
+    if (stitchState.segmentCount >= 6) { showBanner("最多 6 段", true); return; }
+    stitchState.segmentCount += 1;
+    stitchEl();
+  });
+  $("stitch-remove-segment").addEventListener("click", () => {
+    if (stitchState.segmentCount <= 2) { showBanner("至少 2 段", true); return; }
+    stitchState.segmentCount -= 1;
+    stitchEl();
+  });
+  $("stitch-demo").addEventListener("click", loadStitchDemo);
+  $("stitch-run").addEventListener("click", runStitch);
+  stitchEl();
 }
 
 document.addEventListener("DOMContentLoaded", init);

@@ -17,7 +17,13 @@
 
 <div id="banner" class="banner hidden"></div>
 
+<nav class="tabs">
+  <button type="button" class="tab active" data-tab="migrate">标签迁移</button>
+  <button type="button" class="tab" data-tab="stitch">拼稿</button>
+</nav>
+
 <main>
+  <div class="tab-page" id="page-migrate">
   <section class="panel">
     <h2>1. 输入</h2>
     <div class="examples-row">
@@ -63,6 +69,42 @@
     <div id="confirm-status" class="hint"></div>
     <pre id="result-preview" class="hidden"></pre>
   </section>
+  </div>
+
+  <div class="tab-page hidden" id="page-stitch">
+    <section class="panel">
+      <h2>拼稿 · 多段合稿与标签合并</h2>
+      <div class="examples-row">
+        <button id="stitch-demo" type="button">填入拼稿示例（自动建 3 个已确认会话）</button>
+        <span class="hint">按阅读顺序填 2～6 个<strong>不同</strong>会话及其确认版本；每道接缝给 1～3 个候选重叠码点数。各段须在同一次数据库快照读取，版本过期或未确认会整次中止。</span>
+      </div>
+
+      <h3 class="sub-h">1. 段（已确认会话，按阅读顺序）</h3>
+      <div id="stitch-segments"></div>
+      <div class="actions">
+        <button type="button" id="stitch-add-segment">增加一段</button>
+        <button type="button" id="stitch-remove-segment">删除末段</button>
+        <span class="hint" id="stitch-seg-count"></span>
+      </div>
+
+      <h3 class="sub-h">2. 接缝候选重叠码点数</h3>
+      <div id="stitch-seams" class="hint">先确定段数。</div>
+
+      <div class="actions">
+        <button id="stitch-run" class="primary" type="button">试拼</button>
+        <span class="hint" id="stitch-run-status"></span>
+      </div>
+    </section>
+
+    <section class="panel" id="stitch-result-panel">
+      <h2>3. 拼稿结果</h2>
+      <div id="stitch-result" class="hint">尚未试拼。</div>
+      <pre id="stitch-preview" class="hidden"></pre>
+      <div class="actions">
+        <a id="stitch-download" class="button hidden" href="#">下载合稿 JSON</a>
+      </div>
+    </section>
+  </div>
 </main>
 
 <footer>

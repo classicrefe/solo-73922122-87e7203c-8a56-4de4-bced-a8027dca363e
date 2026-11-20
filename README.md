@@ -1,7 +1,9 @@
-# OCR 修订 · 实体标签迁移工具
+# OCR 修订 · 实体标签迁移与多段拼稿工具
 
-语料工程师修订 OCR 文本后，把原文上的实体标签迁移到修订文，供训练使用。
-后端 FastAPI + SQLite，前端为单页网页，交付含 Docker Compose 一键启动。
+语料工程师修订 OCR 文本后，把原文上的实体标签迁移到修订文，供训练使用；
+档案分段扫描时前一段末尾可能在后一段开头重现，另提供**拼稿**入口把
+2～6 个已确认会话按阅读顺序合稿并合并标签。后端 FastAPI + SQLite，
+前端为单页网页（顶部两个标签页），交付含 Docker Compose 一键启动。
 
 ## 快速启动
 
@@ -63,6 +65,41 @@ pytest tests/ -q
 }
 ```
 
+## 拼稿（多段合稿）
+
+在网页顶部切到「拼稿」标签页（或直接调 `POST /api/stitches`）。
+
+**输入规则**
+
+- 按阅读顺序填 2～6 个**不同**会话及其确认版本（`session_id` + `revision`）；
+  各段在**同一个数据库事务（同一次快照）**中读取，会话不存在（404）、
+  版本已过期（409 `stale_revision`）或该版本未确认（409 `unconfirmed`）
+  都会整次中止，并指出是第几段的哪个会话。
+- 每道接缝（相邻两段之间，共 n−1 道）填 1～3 个候选重叠码点数。
+  候选须为正数且**小于两段各自的长度**，且前段末尾与后段开头须**逐码点相同**；
+  不合法的候选会被筛掉并逐条给出原因。
+- 全部实体换算到合稿的 Unicode 码点半开区间：**完全重合**的标签合并为一个，
+  并在 `sources` 中记下各自的会话号（`session_index`）与标签号（`label_id`）；
+  任何其他相交（部分重叠、包含）都使该候选拼法无效。
+- 裁决：合稿码点总数最小的合法拼法，**唯一最短**才落库并提供下载；
+  **并列最短**时返回各组接缝重叠长度供复核，**无解**时提示检查接缝或标签；
+  后两种情况都不生成任何文件（数据库不写行）。
+
+**下载的合稿 JSON 结构**
+
+```json
+{
+  "merged": "合稿全文",
+  "segments": [{"session_index": 1, "session_id": "…", "revision": 1,
+                "start": 0, "end": 5, "length": 5}],
+  "labels": [{"id": "M1", "start": 3, "end": 5, "text": "丁戊",
+              "sources": [
+                {"session_index": 1, "session_id": "…", "label_id": "L1"},
+                {"session_index": 2, "session_id": "…", "label_id": "L1"}]}],
+  "meta": {"overlaps": [2, 2], "merged_length": 9, "segment_count": 3}
+}
+```
+
 ## 重复文字示例（examples/）
 
 | 文件 | 场景 | 现象 |
@@ -101,9 +138,12 @@ pytest tests/ -q
 | PUT | `/api/sessions/{sid}/selections` | 保存选择（整表替换），`revision` 过期返回 409 |
 | POST | `/api/sessions/{sid}/confirm` | 事务内校验版本与联合一致性，成功才原子写入结果 |
 | GET | `/api/sessions/{sid}/download` | 仅当前 `revision` 已确认成功时可下载 |
+| POST | `/api/stitches` | 同事务快照读取 2～6 个已确认会话，试拼并裁决（唯一/并列/无解） |
+| GET | `/api/stitches/{id}/download` | 仅唯一最短合法拼法落过库，才能下载合稿 JSON |
 
 错误码：`400` 输入非法；`404` 会话/结果不存在；`409 stale_revision`
-输入已被他处修改；`409 conflict` 选择互相冲突（附冲突标签）；
+输入已被他处修改（拼稿时表示某段版本过期，整次中止）；`409 conflict`
+选择互相冲突（附冲突标签）；`409 unconfirmed` 拼稿引用的会话版本尚未确认；
 `422 unresolved` 存在未处理的待选标签。
 
 ## 目录结构
@@ -111,11 +151,12 @@ pytest tests/ -q
 ```
 app/
   alignment.py   # 最小编辑距离、落点集合、对齐计数、联合一致性
-  main.py        # FastAPI 路由与确认事务
-  db.py          # SQLite（sessions / selections / results）
+  stitch.py      # 拼稿：接缝候选筛选、区间换算、标签合并/相交、最短裁决
+  main.py        # FastAPI 路由与确认/拼稿事务
+  db.py          # SQLite（sessions / selections / results / stitches）
   schemas.py     # 输入校验
-  static/        # 单页网页（原生 JS）
-tests/           # 单元、API、暴力对照测试
+  static/        # 单页网页（原生 JS，含“标签迁移 / 拼稿”两个标签页）
+tests/           # 单元、API、暴力对照、拼稿算法与 API 测试
 examples/        # 四组示例（含重复文字）
 Dockerfile  docker-compose.yml  requirements*.txt
 ```
